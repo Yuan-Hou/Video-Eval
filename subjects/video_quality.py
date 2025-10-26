@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 from video import VideoData
 
@@ -172,7 +172,7 @@ def _invoke_finevq(
     master_port = os.environ.get("MASTER_PORT") or _find_free_port()
     script_path = repo_dir / "internvl" / "train" / "inference.py"
 
-    args = [
+    base_args = [
         sys.executable,
         "-m",
         "torch.distributed.run",
@@ -253,7 +253,9 @@ def _invoke_finevq(
     ]
 
     if extra_args:
-        args.extend(extra_args)
+        base_args = _merge_cli_args(base_args, extra_args)
+
+    args = base_args
 
     env = os.environ.copy()
     env.setdefault("LAUNCHER", "pytorch")
@@ -268,6 +270,50 @@ def _invoke_finevq(
         env.update(extra_env)
 
     subprocess.run(args, check=True, cwd=repo_dir, env=env)
+
+
+def _merge_cli_args(base: Sequence[str], overrides: Sequence[str]) -> List[str]:
+    """Merge ``overrides`` into ``base`` while allowing replacements.
+
+    The function inspects keys (``--flag`` tokens) from ``overrides`` and
+    removes the matching entries from ``base`` before appending the new
+    arguments.  Both ``--flag value`` and ``--flag=value`` forms are supported.
+    """
+
+    keys: set[str] = set()
+    normalised_overrides: List[str] = []
+
+    idx = 0
+    while idx < len(overrides):
+        token = overrides[idx]
+        key = token.split("=", 1)[0] if token.startswith("--") else ""
+        if key and key.startswith("--"):
+            keys.add(key)
+        normalised_overrides.append(token)
+        idx += 1
+
+        if key and "=" not in token and idx < len(overrides):
+            next_token = overrides[idx]
+            if not next_token.startswith("--"):
+                normalised_overrides.append(next_token)
+                idx += 1
+
+    result: List[str] = []
+    idx = 0
+    while idx < len(base):
+        token = base[idx]
+        if token.startswith("--"):
+            key = token.split("=", 1)[0]
+            if key in keys:
+                idx += 1
+                if "=" not in token and idx < len(base) and not base[idx].startswith("--"):
+                    idx += 1
+                continue
+        result.append(token)
+        idx += 1
+
+    result.extend(normalised_overrides)
+    return result
 
 
 def _collect_scores(csv_path: Path) -> Dict[str, float]:
