@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import socket
 import shutil
@@ -154,6 +155,7 @@ def _invoke_finevq(
     output_csv: Path,
     metrics_path: Path,
     per_device_batch_size: int,
+    global_batch_size: int,
     nproc_per_node: int,
     use_bf16: bool,
     extra_env: Dict[str, str] | None,
@@ -171,6 +173,17 @@ def _invoke_finevq(
 
     master_port = os.environ.get("MASTER_PORT") or _find_free_port()
     script_path = repo_dir / "internvl" / "train" / "inference.py"
+
+    effective_workers = max(1, nproc_per_node)
+    gradient_accumulation = max(
+        1,
+        math.ceil(
+            max(1, global_batch_size)
+            / float(max(1, per_device_batch_size) * effective_workers)
+        ),
+    )
+
+    deepspeed_config = repo_dir / "zero_stage1_config.json"
 
     base_args = [
         sys.executable,
@@ -215,31 +228,37 @@ def _invoke_finevq(
         "--bf16",
         "True" if use_bf16 else "False",
         "--num_train_epochs",
-        "1",
+        "100",
         "--per_device_train_batch_size",
         str(per_device_batch_size),
         "--gradient_accumulation_steps",
-        "1",
+        str(gradient_accumulation),
         "--evaluation_strategy",
         "no",
         "--save_strategy",
-        "no",
+        "steps",
+        "--save_steps",
+        "4800",
+        "--save_total_limit",
+        "1",
         "--learning_rate",
-        "0.0",
+        "4e-5",
         "--weight_decay",
-        "0.0",
+        "0.01",
         "--warmup_ratio",
-        "0.0",
+        "0.03",
+        "--lr_scheduler_type",
+        "cosine",
         "--logging_steps",
         "1",
         "--max_seq_length",
         "4096",
         "--do_train",
-        "False",
+        "True",
         "--grad_checkpoint",
-        "False",
+        "True",
         "--group_by_length",
-        "False",
+        "True",
         "--dynamic_image_size",
         "True",
         "--use_thumbnail",
@@ -251,6 +270,10 @@ def _invoke_finevq(
         "--metrics_file",
         str(metrics_path),
     ]
+
+    if deepspeed_config.exists():
+        base_args.extend(["--deepspeed", str(deepspeed_config)])
+    base_args.extend(["--report_to", "tensorboard"])
 
     if extra_args:
         base_args = _merge_cli_args(base_args, extra_args)
@@ -423,7 +446,7 @@ def evaluate(
         force_clone=model_args.get("force_clone", False),
     )
 
-    use_bf16 = bool(model_args.get("use_bf16", False))
+    use_bf16 = bool(model_args.get("use_bf16", True))
     nproc_per_node = int(model_args.get("nproc_per_node", 1))
     extra_env = dict(model_args.get("env") or {})
     device = device or "cuda"
@@ -436,6 +459,20 @@ def evaluate(
 
     per_video_metrics: Dict[str, Dict[str, Any]] = {}
     aggregate_metrics: Dict[str, Any] = {}
+
+    per_device_batch_size = max(
+        1, int(model_args.get("per_device_batch_size", batch_size))
+    )
+    total_batch_size = model_args.get("batch_size")
+    if total_batch_size is None:
+        total_batch_size_int = per_device_batch_size * max(1, nproc_per_node)
+    else:
+        try:
+            total_batch_size_int = max(1, int(total_batch_size))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "model_args['batch_size'] must be an integer when provided"
+            ) from exc
 
     with tempfile.TemporaryDirectory(prefix="finevq_eval_") as tmp_dir:
         workspace = Path(tmp_dir)
@@ -460,7 +497,8 @@ def evaluate(
             output_dir=output_dir,
             output_csv=output_csv,
             metrics_path=metrics_file,
-            per_device_batch_size=max(1, int(model_args.get("per_device_batch_size", batch_size))),
+            per_device_batch_size=per_device_batch_size,
+            global_batch_size=total_batch_size_int,
             nproc_per_node=nproc_per_node,
             use_bf16=use_bf16,
             extra_env=extra_env,
