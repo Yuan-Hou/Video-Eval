@@ -7,6 +7,7 @@ from tqdm import tqdm
 from video import VideoData
 from utils import load_json, save_json
 
+# 是否默认使用全部帧进行评测，若为 False，则默认采样16帧，因为我的电脑跑全部帧会爆内存
 DEFAULT_ALL_FRAMES = False
 
 # --model_input_dir和--model_output_dir参数，即被评测模型的输入和输出文件夹路径
