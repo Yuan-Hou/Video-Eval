@@ -1,25 +1,26 @@
 """LatentSync audio-visual synchrony evaluation subject.
 
-This module wraps the lip-sync evaluation utilities that ship with the
-LatentSync project (https://github.com/bytedance/LatentSync).  The original
-repository exposes a command line entry-point ``eval/eval_sync_conf.py``.  The
-logic below mirrors that behaviour while integrating it with the
-:mod:`Video-Eval` orchestration framework.
+This module integrates the Stable SyncNet evaluation pipeline that ships with
+LatentSync (https://github.com/bytedance/LatentSync).  Instead of relying on the
+legacy ``eval_sync_conf.py`` workflow, the implementation mirrors the logic of
+``eval/eval_syncnet_acc.py`` which is tailored to the Stable SyncNet model that
+ships with the public ``stable_syncnet.pt`` checkpoint.
 
 Key features
 ============
 * The LatentSync repository is cloned on demand (``third_party/LatentSync`` by
   default) and optionally its Python dependencies can be installed.
-* Checkpoints required by SyncNet and S3FD are fetched automatically from the
-  official Hugging Face repository.  This avoids depending on the ``huggingface
-  cli`` wrapper used upstream.
+* The Stable SyncNet checkpoint is fetched automatically from the official
+  Hugging Face repository without invoking the CLI helper used upstream.
 * Each :class:`~video.VideoData` instance is evaluated individually and the
-  resulting confidence/offset statistics are registered under the
+  resulting accuracy/similarity statistics are registered under the
   ``"latentsync_confidence"`` subject key by default.
 
-The intent is to keep the orchestration lightweight while delegating the
-heavyweight face detection, cropping and SyncNet inference to the upstream
-codebase.
+At a high level the subject repeatedly samples short clips from the target
+video, creates matched/mismatched audio-visual pairs following the upstream
+``SyncNetDataset`` implementation and feeds them through ``StableSyncNet``.
+Accuracies and cosine similarity statistics are aggregated per video to
+quantify lip-sync quality.
 """
 
 from __future__ import annotations
@@ -32,18 +33,24 @@ import sys
 import tempfile
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List
 
 from video import VideoData
 
 LATENTSYNC_REPO_URL = "https://github.com/bytedance/LatentSync.git"
 DEFAULT_REPO_SUBDIR = Path("third_party") / "LatentSync"
 DEFAULT_CHECKPOINT_REPO = "ByteDance/LatentSync-1.5"
-DEFAULT_INITIAL_MODEL = Path("checkpoints") / "auxiliary" / "syncnet_v2.model"
+# ``stable_syncnet.pt`` is the default SyncNet checkpoint shipped with the public
+# LatentSync release hosted on Hugging Face.  Older revisions used the
+# ``checkpoints/auxiliary/syncnet_v2.model`` path, which is now deprecated.  We
+# default to the new filename while still allowing callers to override it via
+# ``model_args["inference_ckpt_path"]`` when needed.
+DEFAULT_INITIAL_MODEL = Path("stable_syncnet.pt")
+LEGACY_SYNCNET_MODEL_PATH = Path("checkpoints") / "auxiliary" / "syncnet_v2.model"
 DEFAULT_RESULTS_KEY = "latentsync_confidence"
 DEFAULT_SYNCNET_BATCH_SIZE = 20
-DEFAULT_SYNCNET_VSHIFT = 15
-DEFAULT_MIN_TRACK = 50
+DEFAULT_SYNCNET_NUM_BATCHES = 20
+DEFAULT_SIMILARITY_THRESHOLD = 0.5
 
 
 class LatentSyncDependencyError(RuntimeError):
@@ -95,6 +102,17 @@ def _ensure_repo_on_path(repo_dir: Path) -> None:
         sys.path.insert(0, str(repo_dir))
 
 
+def _resolve_checkpoint_filename(relative_path: Path) -> str:
+    """Map a checkpoint path to the file stored in the Hugging Face repo."""
+
+    if relative_path == LEGACY_SYNCNET_MODEL_PATH:
+        return DEFAULT_INITIAL_MODEL.name
+    parts = relative_path.parts
+    if relative_path.is_absolute():
+        parts = parts[1:]
+    return "/".join(parts) if parts else relative_path.name
+
+
 def _ensure_checkpoint(
     file_path: Path,
     repo_root: Path,
@@ -124,14 +142,14 @@ def _ensure_checkpoint(
 
     downloaded = hf_hub_download(
         repo_id=repo_id,
-        filename="/".join(relative_path.parts),
+        filename=_resolve_checkpoint_filename(relative_path),
         local_dir=str(repo_root),
         local_dir_use_symlinks=False,
     )
 
     downloaded_path = Path(downloaded)
-    if downloaded_path != file_path:
-        shutil.move(str(downloaded_path), str(file_path))
+    if downloaded_path != file_path and not file_path.exists():
+        shutil.copy2(str(downloaded_path), str(file_path))
 
     return file_path
 
@@ -150,64 +168,6 @@ def _patch_check_model_and_download(repo_root: Path, repo_id: str) -> None:
     util_module.check_model_and_download = _patched  # type: ignore[attr-defined]
 
 
-def _run_syncnet_evaluation(
-    syncnet,
-    syncnet_detector,
-    video_path: Path,
-    workspace: Path,
-    *,
-    min_track: int,
-    scale_videos: bool,
-    syncnet_batch_size: int,
-    syncnet_vshift: int,
-) -> Tuple[int, float, List[Dict[str, float]]]:
-    """Execute the SyncNet confidence evaluation for a single video."""
-
-    detect_root = Path(syncnet_detector.detect_results_dir)
-    if detect_root.exists():
-        shutil.rmtree(detect_root)
-    detect_root.mkdir(parents=True, exist_ok=True)
-
-    syncnet_detector(video_path=str(video_path), min_track=min_track, scale=scale_videos)
-
-    crop_dir = detect_root / "crop"
-    crop_videos = sorted(crop_dir.glob("*.mp4"))
-    if not crop_videos:
-        raise RuntimeError(f"Face not detected in {video_path}")
-
-    per_crop_results: List[Dict[str, float]] = []
-    offsets: List[int] = []
-    confidences: List[float] = []
-
-    temp_root = workspace / "syncnet_temp"
-
-    for crop_video in crop_videos:
-        crop_temp = temp_root / crop_video.stem
-        av_offset, _, conf = syncnet.evaluate(
-            video_path=str(crop_video),
-            temp_dir=str(crop_temp),
-            batch_size=syncnet_batch_size,
-            vshift=syncnet_vshift,
-        )
-
-        av_offset_int = int(av_offset)
-        conf_float = float(conf)
-        offsets.append(av_offset_int)
-        confidences.append(conf_float)
-        per_crop_results.append(
-            {
-                "crop_video": str(crop_video),
-                "confidence": conf_float,
-                "av_offset": av_offset_int,
-            }
-        )
-
-    average_offset = int(round(fmean(offsets)))
-    average_confidence = float(fmean(confidences))
-
-    return average_offset, average_confidence, per_crop_results
-
-
 def evaluate(
     data_list: List[VideoData],
     device: str = "cuda",
@@ -215,7 +175,7 @@ def evaluate(
     sampling: int = 16,
     model_args: Dict[str, Any] | None = None,
 ) -> List[VideoData]:
-    """Run LatentSync SyncNet confidence evaluation on the provided videos."""
+    """Run LatentSync Stable SyncNet evaluation on the provided videos."""
 
     del batch_size, sampling  # Unused but kept for a consistent signature.
 
@@ -236,57 +196,217 @@ def evaluate(
     # Patching must happen before importing modules that depend on the helper.
     _patch_check_model_and_download(repo_dir, model_args.get("checkpoint_repo_id", DEFAULT_CHECKPOINT_REPO))
 
-    syncnet_module = importlib.import_module("eval.syncnet")
-    detector_module = importlib.import_module("eval.syncnet_detect")
-    util_module = importlib.import_module("latentsync.utils.util")
+    try:
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader
+        from accelerate.utils import set_seed
+        from diffusers import AutoencoderKL
+        from einops import rearrange
+        from omegaconf import OmegaConf
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise LatentSyncDependencyError(
+            "Stable SyncNet evaluation requires torch, accelerate, diffusers and einops."
+        ) from exc
 
-    util_module.check_ffmpeg_installed()
+    if device.startswith("cuda"):
+        torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
+    else:
+        torch_device = torch.device(device)
 
-    initial_model = model_args.get("initial_model", DEFAULT_INITIAL_MODEL)
-    initial_model_path = Path(initial_model)
-    if not initial_model_path.is_absolute():
-        initial_model_path = repo_dir / initial_model_path
+    config_path = Path(model_args.get("config_path", "configs/syncnet/syncnet_16_latent.yaml"))
+    if not config_path.is_absolute():
+        config_path = repo_dir / config_path
 
-    _ensure_checkpoint(initial_model_path, repo_dir, model_args.get("checkpoint_repo_id", DEFAULT_CHECKPOINT_REPO))
+    if not config_path.exists():
+        raise FileNotFoundError(f"LatentSync config not found at {config_path}")
 
-    syncnet = syncnet_module.SyncNetEval(device=device)
-    syncnet.loadParameters(str(initial_model_path))
+    base_config = OmegaConf.load(str(config_path))
 
-    min_track = int(model_args.get("min_track", DEFAULT_MIN_TRACK))
-    scale_videos = bool(model_args.get("scale_videos", False))
+    checkpoint_repo_id = model_args.get("checkpoint_repo_id", DEFAULT_CHECKPOINT_REPO)
+    ckpt_path_arg = model_args.get("inference_ckpt_path") or base_config.ckpt.get("inference_ckpt_path")
+    if not ckpt_path_arg:
+        ckpt_path_arg = DEFAULT_INITIAL_MODEL
+
+    ckpt_path = Path(ckpt_path_arg)
+    if not ckpt_path.is_absolute():
+        ckpt_path = repo_dir / ckpt_path
+
+    _ensure_checkpoint(ckpt_path, repo_dir, checkpoint_repo_id)
+
+    model_dtype = torch.float16 if torch_device.type == "cuda" else torch.float32
+
+    syncnet_module = importlib.import_module("latentsync.models.stable_syncnet")
+
+    syncnet = syncnet_module.StableSyncNet(OmegaConf.to_container(base_config.model)).to(torch_device)
+
+    try:
+        checkpoint = torch.load(str(ckpt_path), map_location=torch_device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(str(ckpt_path), map_location=torch_device)
+
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    syncnet.load_state_dict(state_dict)
+    syncnet.to(dtype=model_dtype)
+    syncnet.requires_grad_(False)
+    syncnet.eval()
+
+    latent_space = bool(model_args.get("latent_space", base_config.data.get("latent_space", True)))
+
+    vae = None
+    if latent_space:
+        vae_kwargs = {"subfolder": "vae", "torch_dtype": model_dtype}
+        if torch_device.type == "cuda":
+            vae_kwargs["revision"] = "fp16"
+        vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-inpainting", **vae_kwargs)
+        vae.requires_grad_(False)
+        vae.to(torch_device)
+
+    similarity_threshold = float(model_args.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
     syncnet_batch_size = int(model_args.get("syncnet_batch_size", DEFAULT_SYNCNET_BATCH_SIZE))
-    syncnet_vshift = int(model_args.get("syncnet_vshift", DEFAULT_SYNCNET_VSHIFT))
+    syncnet_num_batches = int(model_args.get("syncnet_num_batches", DEFAULT_SYNCNET_NUM_BATCHES))
+    syncnet_num_workers = int(model_args.get("syncnet_num_workers", 0))
+    seed = int(model_args.get("seed", base_config.run.get("seed", 42)))
     results_key = model_args.get("results_key", DEFAULT_RESULTS_KEY)
+
+    if syncnet_batch_size <= 0:
+        raise ValueError("syncnet_batch_size must be a positive integer")
+    if syncnet_num_batches <= 0:
+        raise ValueError("syncnet_num_batches must be a positive integer")
+
+    set_seed(seed)
+
+    dataset_module = importlib.import_module("latentsync.data.syncnet_dataset")
+
+    config_overrides = {
+        "num_frames": int(model_args.get("num_frames", base_config.data.get("num_frames", 16))),
+        "resolution": int(model_args.get("resolution", base_config.data.get("resolution", 256))),
+        "audio_sample_rate": int(
+            model_args.get("audio_sample_rate", base_config.data.get("audio_sample_rate", 16000))
+        ),
+        "video_fps": int(model_args.get("video_fps", base_config.data.get("video_fps", 25))),
+        "lower_half": bool(model_args.get("lower_half", base_config.data.get("lower_half", False))),
+    }
 
     with tempfile.TemporaryDirectory(prefix="latentsync_eval_") as workspace_dir:
         workspace = Path(workspace_dir)
-        detect_results_dir = workspace / "detect_results"
-        syncnet_detector = detector_module.SyncNetDetector(
-            device=device,
-            detect_results_dir=str(detect_results_dir),
-        )
+
         for data in data_list:
-            video_path = Path(data.video_path)
-            try:
-                avg_offset, avg_conf, crop_details = _run_syncnet_evaluation(
-                    syncnet,
-                    syncnet_detector,
-                    video_path,
-                    workspace,
-                    min_track=min_track,
-                    scale_videos=scale_videos,
-                    syncnet_batch_size=syncnet_batch_size,
-                    syncnet_vshift=syncnet_vshift,
-                )
-                result = {
-                    "confidence": avg_conf,
-                    "av_offset": avg_offset,
-                    "crop_details": crop_details,
-                }
-            except Exception as exc:  # pragma: no cover - safeguard for runtime failures
-                result = {"error": str(exc)}
-            finally:
-                shutil.rmtree(syncnet_detector.detect_results_dir, ignore_errors=True)
+            video_path = Path(data.video_path).resolve()
+
+            video_config = OmegaConf.create(OmegaConf.to_container(base_config, resolve=True))
+
+            video_config.data.latent_space = latent_space
+            video_config.data.batch_size = syncnet_batch_size
+            video_config.data.num_workers = syncnet_num_workers
+            video_config.data.num_val_samples = syncnet_batch_size * syncnet_num_batches
+            video_config.run.seed = seed
+
+            for key, value in config_overrides.items():
+                setattr(video_config.data, key, value)
+
+            audio_cache_dir = workspace / f"mel_cache_{video_path.stem}"
+            audio_cache_dir.mkdir(parents=True, exist_ok=True)
+            video_config.data.audio_mel_cache_dir = str(audio_cache_dir)
+
+            filelist_path = workspace / f"video_list_{video_path.stem}.txt"
+            with filelist_path.open("w", encoding="utf-8") as handle:
+                for _ in range(video_config.data.num_val_samples):
+                    handle.write(str(video_path) + "\n")
+
+            video_config.data.val_fileslist = str(filelist_path)
+            video_config.data.val_data_dir = ""
+
+            dataset = dataset_module.SyncNetDataset(
+                video_config.data.val_data_dir,
+                video_config.data.val_fileslist,
+                video_config,
+            )
+
+            dataset.worker_init_fn(0)
+
+            dataloader = DataLoader(
+                dataset,
+                batch_size=syncnet_batch_size,
+                shuffle=False,
+                num_workers=syncnet_num_workers,
+                drop_last=False,
+                worker_init_fn=dataset.worker_init_fn,
+            )
+
+            num_val_batches = video_config.data.num_val_samples // syncnet_batch_size
+            num_val_batches = max(1, num_val_batches)
+
+            num_correct_preds = 0
+            num_total_preds = 0
+            similarities: List[float] = []
+            positive_sims: List[float] = []
+            negative_sims: List[float] = []
+
+            batches_consumed = 0
+            dataloader_iter: Iterator = iter(dataloader)
+
+            while batches_consumed < num_val_batches:
+                try:
+                    batch = next(dataloader_iter)
+                except StopIteration:
+                    dataloader_iter = iter(dataloader)
+                    batch = next(dataloader_iter)
+
+                frames = batch["frames"].to(device=torch_device, dtype=model_dtype)
+                audio_samples = batch["audio_samples"].to(device=torch_device, dtype=model_dtype)
+                labels = batch["y"].to(device=torch_device, dtype=model_dtype).squeeze(1)
+
+                if latent_space:
+                    frames = rearrange(frames, "b f c h w -> (b f) c h w")
+                    with torch.no_grad():
+                        frames = vae.encode(frames).latent_dist.sample() * 0.18215
+                    frames = rearrange(frames, "(b f) c h w -> b (f c) h w", f=video_config.data.num_frames)
+                else:
+                    frames = rearrange(frames, "b f c h w -> b (f c) h w")
+
+                if video_config.data.lower_half:
+                    height = frames.shape[2]
+                    frames = frames[:, :, height // 2 :, :]
+
+                with torch.no_grad():
+                    vision_embeds, audio_embeds = syncnet(frames, audio_samples)
+
+                sims = nn.functional.cosine_similarity(vision_embeds, audio_embeds)
+                preds_bool = sims > similarity_threshold
+                labels_bool = labels >= 0.5
+
+                matches = (preds_bool == labels_bool).sum().item()
+                batch_size_actual = len(sims)
+
+                num_correct_preds += matches
+                num_total_preds += batch_size_actual
+
+                sims_cpu = sims.detach().cpu().tolist()
+                labels_cpu = labels.detach().cpu().tolist()
+                similarities.extend(sims_cpu)
+
+                for sim_value, label_value in zip(sims_cpu, labels_cpu):
+                    if label_value >= 0.5:
+                        positive_sims.append(sim_value)
+                    else:
+                        negative_sims.append(sim_value)
+
+                batches_consumed += 1
+
+            accuracy = float(num_correct_preds) / float(num_total_preds) if num_total_preds else 0.0
+            mean_similarity = fmean(similarities) if similarities else 0.0
+            positive_mean = fmean(positive_sims) if positive_sims else 0.0
+            negative_mean = fmean(negative_sims) if negative_sims else 0.0
+
+            result = {
+                "sync_accuracy": accuracy,
+                "num_samples": num_total_preds,
+                "mean_similarity": mean_similarity,
+                "positive_similarity": positive_mean,
+                "negative_similarity": negative_mean,
+                "similarity_threshold": similarity_threshold,
+            }
 
             data.register_result(results_key, result)
 
