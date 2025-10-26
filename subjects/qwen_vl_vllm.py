@@ -196,7 +196,7 @@ def evaluate(
     sampling_params = _build_sampling_params(model_args.get("sampling_options", {}))
     llm_kwargs = _collect_llm_kwargs(model_args)
 
-    llm = LLM(model=model_name, allowed_local_media_path=Path(data.video_path).parent, **llm_kwargs)
+    llm = LLM(model=model_name, allowed_local_media_path="/", **llm_kwargs)
 
     results: List[VideoData] = []
     for data in tqdm(data_list, desc="Evaluating Qwen3-VL via vLLM"):
