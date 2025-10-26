@@ -122,8 +122,8 @@ def _prepare_messages(
     if include_video:
         user_content.append(
             {
-                "type": "video",
-                "video_url": f"file://{video_path}",
+                "type": "video_url",
+                "video_url": {"url": f"file://{video_path}"},
             }
         )
 
