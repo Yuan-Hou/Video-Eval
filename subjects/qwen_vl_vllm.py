@@ -101,7 +101,7 @@ def _prepare_messages(
     video_path: Path,
     prompt: str,
     system_prompt: Optional[str],
-    include_video: bool,
+    include_video: bool
 ) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = []
 
@@ -196,7 +196,7 @@ def evaluate(
     sampling_params = _build_sampling_params(model_args.get("sampling_options", {}))
     llm_kwargs = _collect_llm_kwargs(model_args)
 
-    llm = LLM(model=model_name, **llm_kwargs)
+    llm = LLM(model=model_name, allowed_local_media_path="*", **llm_kwargs)
 
     results: List[VideoData] = []
     for data in tqdm(data_list, desc="Evaluating Qwen3-VL via vLLM"):
