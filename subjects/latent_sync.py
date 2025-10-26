@@ -12,8 +12,6 @@ from typing import Dict, Iterable, List, Tuple
 
 from video import VideoData
 
-from tqdm import tqdm
-
 LATENTSYNC_REPO_URL = "https://github.com/bytedance/LatentSync.git"
 DEFAULT_REPO_SUBDIR = Path("third_party") / "LatentSync"
 DEFAULT_HF_REPO_ID = "ByteDance/LatentSync-1.5"
@@ -107,7 +105,7 @@ def _run_syncnet(
     video_path: str,
     temp_root: Path,
     min_track: int,
-) -> Tuple[int, float, int]:
+) -> Tuple[List[int], List[float]]:
     """Execute the SyncNet pipeline for a single video file."""
 
     detect_dir = temp_root / "detect"
@@ -130,7 +128,7 @@ def _run_syncnet(
         confidences.append(float(conf))
 
     shutil.rmtree(detect_dir, ignore_errors=True)
-    return int(fmean(offsets)), float(fmean(confidences)), len(crop_videos)
+    return offsets, confidences
 
 
 def evaluate(
@@ -170,17 +168,21 @@ def evaluate(
         with tempfile.TemporaryDirectory(prefix="latentsync_eval_") as tmpdir:
             temp_root = Path(tmpdir)
             try:
-                av_offset, confidence, crops = _run_syncnet(
+                offsets, confidences = _run_syncnet(
                     syncnet,
                     detector,
                     video_data.video_path,
                     temp_root=temp_root,
                     min_track=min_track,
                 )
+                avg_offset = int(round(fmean(offsets))) if offsets else None
+                avg_confidence = float(fmean(confidences)) if confidences else None
                 result = {
-                    "confidence": confidence,
-                    "av_offset": av_offset,
-                    "num_crops": crops,
+                    "confidence": avg_confidence,
+                    "av_offset": avg_offset,
+                    "num_crops": len(offsets),
+                    "crop_offsets": offsets,
+                    "crop_confidences": confidences,
                 }
             except Exception as exc:  # pragma: no cover - depends on runtime data
                 result = {"error": str(exc)}
