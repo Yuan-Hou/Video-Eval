@@ -158,10 +158,12 @@ def evaluate(data_list: List[VideoData], device='cuda', batch_size=16, sampling=
             
             total_similarity = 0.0
             valid_frame_count = 0
+            sim_list = []
             for feats in frame_features:
                 if feats.shape[0] == 0:
                     continue  # 当前帧无检测到人脸，跳过
                 sim = pairwise_cosine_sim(feats, ref_feature[0])  # 计算与参考图的最大相似度
+                sim_list.append(sim)
                 total_similarity += sim
                 valid_frame_count += 1
             if valid_frame_count == 0:
@@ -169,7 +171,8 @@ def evaluate(data_list: List[VideoData], device='cuda', batch_size=16, sampling=
             else:
                 average_similarity = total_similarity / valid_frame_count
             results = {
-                "arcface_consistency": average_similarity
+                "arcface_consistency": average_similarity,
+                "arcface_consistency_list": sim_list
             }
             data.register_result("arcface_consistency", results)
     return data_list

@@ -81,7 +81,9 @@ def evaluate(data_list: list[VideoData], device='cuda', batch_size=16, sampling=
             # 汇总结果：平均值
             results = {
                 "similarity": similarities.mean().item(),
-                "temporal_consistency": temporal_consistency.mean().item()
+                "temporal_consistency": temporal_consistency.mean().item(),
+                "similarity_list": similarities.cpu().tolist(),
+                "temporal_consistency_list": temporal_consistency.cpu().tolist()
             }
             results["overall_score"] = (results["similarity"] + results["temporal_consistency"]) / 2.0
             data.register_result("dino_consistency", results)

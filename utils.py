@@ -136,6 +136,8 @@ def load_video(video_path, data_transform=None, num_frames=None, return_tensor=T
     If a data_transform is provided, it is applied to the buffer before converting it to a tensor.
     Finally, the tensor is permuted to match the expected (T, C, H, W) format.
     """
+    if num_frames is not None and num_frames == 0:
+        num_frames = None  # Use all frames
     if video_path.endswith('.gif'):
         frame_ls = []
         img = Image.open(video_path)
