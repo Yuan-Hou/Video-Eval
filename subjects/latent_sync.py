@@ -12,6 +12,8 @@ from typing import Dict, Iterable, List, Tuple
 
 from video import VideoData
 
+from tqdm import tqdm
+
 LATENTSYNC_REPO_URL = "https://github.com/bytedance/LatentSync.git"
 DEFAULT_REPO_SUBDIR = Path("third_party") / "LatentSync"
 DEFAULT_HF_REPO_ID = "ByteDance/LatentSync-1.5"
