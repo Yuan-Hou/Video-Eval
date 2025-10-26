@@ -12,6 +12,8 @@ from typing import Dict, Iterable, List, Tuple
 
 from video import VideoData
 
+from tqdm import tqdm
+
 LATENTSYNC_REPO_URL = "https://github.com/bytedance/LatentSync.git"
 DEFAULT_REPO_SUBDIR = Path("third_party") / "LatentSync"
 DEFAULT_HF_REPO_ID = "ByteDance/LatentSync-1.5"
@@ -164,7 +166,7 @@ def evaluate(
     min_track = int(model_args.get("min_track", 50))
     subject_name = model_args.get("subject_name", SUBJECT_NAME)
 
-    for video_data in data_list:
+    for video_data in tqdm(data_list, desc="Evaluating LatentSync"):
         with tempfile.TemporaryDirectory(prefix="latentsync_eval_") as tmpdir:
             temp_root = Path(tmpdir)
             try:
