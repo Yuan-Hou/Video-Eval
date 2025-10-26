@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from video import VideoData
 
@@ -316,26 +316,91 @@ def _merge_cli_args(base: Sequence[str], overrides: Sequence[str]) -> List[str]:
     return result
 
 
-def _collect_scores(csv_path: Path) -> Dict[str, float]:
-    """Load the FineVQ CSV output into a dictionary."""
+def _parse_metric_value(value: Any) -> Any:
+    """Attempt to coerce FineVQ metric values to numeric types when possible."""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for caster in (int, float):
+        try:
+            return caster(text)
+        except (TypeError, ValueError):
+            continue
+    return text
+
+
+def _collect_scores(csv_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load the FineVQ CSV output, preserving every reported metric."""
 
     if not csv_path.exists():
         raise FileNotFoundError(f"FineVQ output CSV not found: {csv_path}")
 
-    results: Dict[str, float] = {}
+    results: Dict[str, Dict[str, Any]] = {}
     with csv_path.open("r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            name = row.get("video_name", "").strip()
-            score_str = row.get("pred_score")
+            if not row:
+                continue
+            name = (row.get("video_name") or "").strip()
             if not name:
                 continue
-            try:
-                score = float(score_str)
-            except (TypeError, ValueError):
-                continue
-            results[name] = score
+            metrics: Dict[str, Any] = {}
+            for key, raw_value in row.items():
+                if key == "video_name":
+                    continue
+                parsed = _parse_metric_value(raw_value)
+                if parsed is not None:
+                    metrics[key] = parsed
+            results[name] = metrics
     return results
+
+
+def _parse_metrics_file(metrics_path: Path) -> Dict[str, Any]:
+    """Parse aggregate metrics saved by FineVQ when available."""
+
+    if not metrics_path.exists():
+        return {}
+
+    content = metrics_path.read_text(encoding="utf-8").strip()
+    if not content:
+        return {}
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        metrics: Dict[str, Any] = {}
+        for key, value in parsed.items():
+            parsed_value = _parse_metric_value(value)
+            if parsed_value is not None:
+                metrics[key] = parsed_value
+        return metrics
+
+    metrics: Dict[str, Any] = {}
+    for chunk in content.replace(",", "\n").splitlines():
+        text = chunk.strip()
+        if not text:
+            continue
+        for separator in (":", "="):
+            if separator in text:
+                key, value = text.split(separator, 1)
+                key = key.strip()
+                value = value.strip()
+                if key:
+                    parsed_value = _parse_metric_value(value)
+                    if parsed_value is not None:
+                        metrics[key] = parsed_value
+                break
+    return metrics
 
 
 def evaluate(
@@ -369,6 +434,9 @@ def evaluate(
         extra_env.setdefault("CUDA_VISIBLE_DEVICES", "")
     extra_args = model_args.get("extra_args") or []
 
+    per_video_metrics: Dict[str, Dict[str, Any]] = {}
+    aggregate_metrics: Dict[str, Any] = {}
+
     with tempfile.TemporaryDirectory(prefix="finevq_eval_") as tmp_dir:
         workspace = Path(tmp_dir)
         alias_pairs: List[Tuple[str, Path]] = []
@@ -399,18 +467,29 @@ def evaluate(
             extra_args=extra_args,
         )
 
-        score_map = _collect_scores(output_csv)
+        per_video_metrics = _collect_scores(output_csv)
+        aggregate_metrics = _parse_metrics_file(metrics_file)
 
     for (alias, _), video in zip(alias_pairs, data_list):
-        score = score_map.get(alias)
-        results = {
-            "video_quality_score": score,
+        metrics = dict(per_video_metrics.get(alias, {}))
+        score = metrics.get("pred_score")
+        if isinstance(score, (int, float)):
+            score_value: Any = float(score)
+        else:
+            score_value = score
+
+        result_payload: Dict[str, Any] = {
+            "video_quality_score": score_value,
+            "metrics": metrics,
             "details": {
                 "alias": alias,
                 "source_video": video.video_path,
             },
         }
-        video.register_result("video_quality", results)
+        if aggregate_metrics:
+            result_payload["aggregate_metrics"] = aggregate_metrics
+
+        video.register_result("video_quality", result_payload)
 
     return data_list
 
