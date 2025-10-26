@@ -1,0 +1,5 @@
+__pycache__/
+
+evaluation_results/
+
+checkpoints/
